@@ -39,7 +39,7 @@ def _cached_suggest(q: str, limit: int) -> list:
         "q": q,
         "key": TWOGIS_API_KEY,
         "locale": "ru_KZ",
-        "region_id": "56",          # Atyrau region
+        "region_id": "208",          # Atyrau region
         "fields": "items.point",
         "limit": limit,
     }
@@ -55,7 +55,7 @@ def _cached_suggest(q: str, limit: int) -> list:
     data = resp.json()
     results = []
     for item in data.get("result", {}).get("items", []):
-        # skip user_query type — it has no address
+        logger.info(f"Item type: {item.get('type')}, name: {item.get('name')}")
         if item.get("type") == "user_query":
             continue
 
@@ -167,22 +167,40 @@ async def search_address(
     return {"query": q, "results": results}
 
 
-# ── Debug endpoint — hit this to verify API key and URL work ──
 @app.get("/debug")
 async def debug():
+    """Test endpoint — returns raw 2GIS response to diagnose empty suggestions."""
     try:
-        params = {
-            "q": "Атырау",
-            "key": TWOGIS_API_KEY,
-            "locale": "ru_KZ",
-            "limit": 2,
-        }
-        with httpx.Client(timeout=10.0) as client:
-            resp = client.get(TWOGIS_SUGGEST_URL, params=params)
-        return {
-            "status_code": resp.status_code,
-            "url_called": str(resp.url),
-            "response": resp.json(),
-        }
+        results = {}
+        for test_q in ["Атырау", "Atyrau", "Aktau", "улица"]:
+            params = {
+                "q": test_q,
+                "key": TWOGIS_API_KEY,
+                "locale": "ru_KZ",
+                "fields": "items.point",
+                "limit": 5,
+            }
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.get(TWOGIS_SUGGEST_URL, params=params)
+            data = resp.json()
+            items = data.get("result", {}).get("items", [])
+            
+            results[test_q] = {
+                "status": resp.status_code,
+                "total_count": len(items),
+                # Show every item's type, name, and whether it has a point
+                "items_detail": [
+                    {
+                        "type": item.get("type"),
+                        "name": item.get("name"),
+                        "full_name": item.get("full_name"),
+                        "has_point": item.get("point") is not None,
+                    }
+                    for item in items
+                ],
+                # Show raw first item so you can see all available fields
+                "raw_first_item": items[0] if items else None,
+            }
+        return {"status": "ok", "tests": results}
     except Exception as e:
         return {"error": str(e)}
