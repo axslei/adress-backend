@@ -1,7 +1,10 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from joblib import Memory
 import httpx
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="2GIS Address Search API", version="1.0.0")
 
@@ -12,45 +15,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── joblib cache (stores results on disk so repeated queries are instant) ──
-memory = Memory(location=".joblib_cache", verbose=0)
+TWOGIS_API_KEY = "30202935-f892-4b86-b3f6-948471f69e31"
 
-TWOGIS_API_KEY = "30202935-f892-4b86-b3f6-948471f69e31"   # ← paste your key directly here
+# ✅ FIXED URLs
+TWOGIS_SUGGEST_URL = "https://catalog.api.2gis.com/3.0/suggests"
 TWOGIS_GEOCODE_URL = "https://catalog.api.2gis.com/3.0/items/geocode"
-TWOGIS_SUGGEST_URL = "https://suggest.api.2gis.com/1.0"
 
 
-# ── cached helper functions (called synchronously, results stored on disk) ──
-@memory.cache
+# ── joblib cache removed — was causing issues on Render (disk wipes on redeploy)
+# ── Using simple in-memory dict cache instead (fast, reliable, zero dependencies)
+
+_suggest_cache: dict = {}
+_search_cache: dict = {}
+
+
 def _cached_suggest(q: str, limit: int) -> list:
-    """Cached autocomplete — same query returns instantly on repeat calls."""
-    import httpx as _httpx  # imported inside so joblib can pickle cleanly
+    cache_key = f"{q}|{limit}"
+    if cache_key in _suggest_cache:
+        logger.info(f"Cache hit for suggest: {q}")
+        return _suggest_cache[cache_key]
+
     params = {
         "q": q,
         "key": TWOGIS_API_KEY,
         "locale": "ru_KZ",
-        "region_id": "56",
+        "region_id": "56",          # Atyrau region
+        "fields": "items.point",
         "limit": limit,
     }
-    with _httpx.Client(timeout=8.0) as client:
+
+    logger.info(f"Calling 2GIS suggest: {q}")
+
+    with httpx.Client(timeout=10.0) as client:
         resp = client.get(TWOGIS_SUGGEST_URL, params=params)
+        logger.info(f"2GIS response status: {resp.status_code}")
+        logger.info(f"2GIS response body: {resp.text[:500]}")  # log first 500 chars
         resp.raise_for_status()
+
     data = resp.json()
     results = []
     for item in data.get("result", {}).get("items", []):
         results.append({
             "name": item.get("name", ""),
             "full_address": item.get("full_name", item.get("name", "")),
-            "lat": item.get("point", {}).get("lat"),
-            "lon": item.get("point", {}).get("lon"),
+            "lat": item.get("point", {}).get("lat") if item.get("point") else None,
+            "lon": item.get("point", {}).get("lon") if item.get("point") else None,
         })
+
+    _suggest_cache[cache_key] = results
     return results
 
 
-@memory.cache
 def _cached_search(q: str, city: str, limit: int) -> list:
-    """Cached full geocode search."""
-    import httpx as _httpx
+    cache_key = f"{q}|{city}|{limit}"
+    if cache_key in _search_cache:
+        return _search_cache[cache_key]
+
     params = {
         "q": f"{city} {q}",
         "key": TWOGIS_API_KEY,
@@ -58,9 +78,14 @@ def _cached_search(q: str, city: str, limit: int) -> list:
         "page_size": limit,
         "type": "building,street,adm_div",
     }
-    with _httpx.Client(timeout=10.0) as client:
+
+    logger.info(f"Calling 2GIS geocode: {q}")
+
+    with httpx.Client(timeout=10.0) as client:
         resp = client.get(TWOGIS_GEOCODE_URL, params=params)
+        logger.info(f"2GIS geocode status: {resp.status_code}")
         resp.raise_for_status()
+
     data = resp.json()
     items = data.get("result", {}).get("items", [])
     results = []
@@ -74,10 +99,10 @@ def _cached_search(q: str, city: str, limit: int) -> list:
             "lat": point.get("lat"),
             "lon": point.get("lon"),
         })
+
+    _search_cache[cache_key] = results
     return results
 
-
-# ── endpoints ──────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -92,9 +117,15 @@ async def suggest_address(
     try:
         suggestions = _cached_suggest(q.strip(), limit)
     except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"2GIS error: {e.response.status_code}")
-    except httpx.RequestError:
+        logger.error(f"2GIS HTTP error: {e.response.status_code} — {e.response.text}")
+        raise HTTPException(status_code=502, detail=f"2GIS error: {e.response.status_code} — {e.response.text}")
+    except httpx.RequestError as e:
+        logger.error(f"2GIS request error: {e}")
         raise HTTPException(status_code=503, detail="Could not reach 2GIS")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
     return {"query": q, "suggestions": suggestions}
 
 
@@ -107,7 +138,34 @@ async def search_address(
     try:
         results = _cached_search(q.strip(), city.strip(), limit)
     except httpx.HTTPStatusError as e:
+        logger.error(f"2GIS HTTP error: {e.response.status_code} — {e.response.text}")
         raise HTTPException(status_code=502, detail=f"2GIS error: {e.response.status_code}")
-    except httpx.RequestError:
+    except httpx.RequestError as e:
+        logger.error(f"2GIS request error: {e}")
         raise HTTPException(status_code=503, detail="Could not reach 2GIS")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
     return {"query": q, "results": results}
+
+
+# ── Debug endpoint — hit this to verify API key and URL work ──
+@app.get("/debug")
+async def debug():
+    try:
+        params = {
+            "q": "Атырау",
+            "key": TWOGIS_API_KEY,
+            "locale": "ru_KZ",
+            "limit": 2,
+        }
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(TWOGIS_SUGGEST_URL, params=params)
+        return {
+            "status_code": resp.status_code,
+            "url_called": str(resp.url),
+            "response": resp.json(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
