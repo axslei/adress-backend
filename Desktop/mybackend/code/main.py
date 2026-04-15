@@ -55,11 +55,28 @@ def _cached_suggest(q: str, limit: int) -> list:
     data = resp.json()
     results = []
     for item in data.get("result", {}).get("items", []):
+        # skip user_query type — it has no address
+        if item.get("type") == "user_query":
+            continue
+
+        name = item.get("name", "")
+        full_name = item.get("full_name", "")
+        address_name = item.get("address_name", "")
+
+        # Build a clean display address
+        if full_name:
+            display = full_name
+        elif address_name:
+            display = f"{name}, {address_name}"
+        else:
+            display = name
+
+        point = item.get("point")
         results.append({
-            "name": item.get("name", ""),
-            "full_address": item.get("full_name", item.get("name", "")),
-            "lat": item.get("point", {}).get("lat") if item.get("point") else None,
-            "lon": item.get("point", {}).get("lon") if item.get("point") else None,
+            "name": name,
+            "full_address": display,
+            "lat": point.get("lat") if point else None,
+            "lon": point.get("lon") if point else None,
         })
 
     _suggest_cache[cache_key] = results
