@@ -17,13 +17,8 @@ app.add_middleware(
 
 TWOGIS_API_KEY = "30202935-f892-4b86-b3f6-948471f69e31"
 
-# ✅ FIXED URLs
 TWOGIS_SUGGEST_URL = "https://catalog.api.2gis.com/3.0/suggests"
 TWOGIS_GEOCODE_URL = "https://catalog.api.2gis.com/3.0/items/geocode"
-
-
-# ── joblib cache removed — was causing issues on Render (disk wipes on redeploy)
-# ── Using simple in-memory dict cache instead (fast, reliable, zero dependencies)
 
 _suggest_cache: dict = {}
 _search_cache: dict = {}
@@ -39,7 +34,9 @@ def _cached_suggest(q: str, limit: int) -> list:
         "q": q,
         "key": TWOGIS_API_KEY,
         "locale": "ru_KZ",
-        "region_id": "208",          # Atyrau region
+        # FIX 1: Removed region_id — it was filtering out results because
+        # 208 is not Atyrau's correct 2GIS region ID. Without it, the API
+        # uses the query text itself to find the right region.
         "fields": "items.point",
         "limit": limit,
     }
@@ -49,19 +46,25 @@ def _cached_suggest(q: str, limit: int) -> list:
     with httpx.Client(timeout=10.0) as client:
         resp = client.get(TWOGIS_SUGGEST_URL, params=params)
         logger.info(f"2GIS response status: {resp.status_code}")
-        logger.info(f"2GIS response body: {resp.text[:500]}")  # log first 500 chars
+        logger.info(f"2GIS response body: {resp.text[:500]}")
         resp.raise_for_status()
 
     data = resp.json()
     results = []
+
+    # FIX 2: Broadened accepted types. 2GIS also returns "crossroad",
+    # "attraction", and others that are valid delivery addresses.
+    # Only skip internal/meta types.
+    SKIP_TYPES = {"user_query", "region", "country"}
+
     for item in data.get("result", {}).get("items", []):
-        logger.info(f"Item type: {item.get('type')}, name: {item.get('name')}")
-        if item.get("type") == "user_query":
+        item_type = item.get("type", "")
+        if item_type in SKIP_TYPES:
             continue
 
-        name = item.get("name", "")
-        full_name = item.get("full_name", "")
-        address_name = item.get("address_name", "")
+        name = item.get("name") or ""
+        full_name = item.get("full_name") or ""
+        address_name = item.get("address_name") or ""
 
         # Build a clean display address
         if full_name:
@@ -70,6 +73,10 @@ def _cached_suggest(q: str, limit: int) -> list:
             display = f"{name}, {address_name}"
         else:
             display = name
+
+        # Skip results with no usable name
+        if not display.strip():
+            continue
 
         point = item.get("point")
         results.append({
@@ -184,11 +191,10 @@ async def debug():
                 resp = client.get(TWOGIS_SUGGEST_URL, params=params)
             data = resp.json()
             items = data.get("result", {}).get("items", [])
-            
+
             results[test_q] = {
                 "status": resp.status_code,
                 "total_count": len(items),
-                # Show every item's type, name, and whether it has a point
                 "items_detail": [
                     {
                         "type": item.get("type"),
@@ -198,7 +204,6 @@ async def debug():
                     }
                     for item in items
                 ],
-                # Show raw first item so you can see all available fields
                 "raw_first_item": items[0] if items else None,
             }
         return {"status": "ok", "tests": results}
